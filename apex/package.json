@@ -1,0 +1,19 @@
+{
+  "name": "apex-ai",
+  "private": true,
+  "description": "Apex AI notification system: shared core, Supabase backend and Expo mobile app.",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "npm run test:core && npm run test:server",
+    "test:core": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test packages/notifications-core/test/*.test.ts",
+    "test:server": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test --test-concurrency=1 packages/notifications-server/test/*.test.ts",
+    "test:db": "bash scripts/test-db.sh",
+    "typecheck": "tsc -p packages/notifications-core && tsc -p packages/notifications-server && tsc -p mobile"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@types/node": "22.20.5"
+  }
+}
