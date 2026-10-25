@@ -51,12 +51,19 @@ export async function scanReminders(db: Db, opts: { now: Date }): Promise<Remind
     let created = 0
     let duplicates = 0
     for (const g of groups.values()) {
-      const [s] = await tx<{ id: string; name: string; session_type: SessionType; starts_at: Date; event_id: string; event_name: string }[]>`
-        select s.id, s.name, s.session_type, s.starts_at, e.id as event_id, e.name as event_name
+      // FOR SHARE blocks a concurrent reschedule (ingest takes FOR UPDATE) until this scan
+      // commits, so the session-change job always sees, and can cancel, what we create.
+      const [s] = await tx<{ id: string; name: string; session_type: SessionType; starts_at: Date | null; status: string; time_status: string; event_id: string; event_name: string }[]>`
+        select s.id, s.name, s.session_type, s.starts_at, s.status, s.time_status, e.id as event_id, e.name as event_name
           from public.event_sessions s join public.events e on e.id = s.event_id
-         where s.id = ${g.sessionId}`
-      if (!s) continue
-      const startsAtIso = s.starts_at.toISOString()
+         where s.id = ${g.sessionId}
+           for share of s`
+      if (!s || !s.starts_at || s.status !== 'scheduled' || s.time_status !== 'confirmed') continue
+      // Re-check against the locked row: the time may have changed since the candidate query.
+      const fireAt = s.starts_at.getTime() - g.offset * 60_000
+      if (fireAt <= from.getTime() || fireAt > now.getTime()) continue
+      const startsAt = s.starts_at
+      const startsAtIso = startsAt.toISOString()
       const r = await fanOut(
         tx,
         {
@@ -65,14 +72,14 @@ export async function scanReminders(db: Db, opts: { now: Date }): Promise<Remind
           dedupeKey: dedupeKeys.sessionReminder(s.id, startsAtIso, g.offset),
           deepLink: `/events/${s.event_id}`,
           relatedSessionId: s.id,
-          sessionStartsAt: s.starts_at,
+          sessionStartsAt: startsAt,
           data: { type: 'session_reminder', sessionId: s.id, eventId: s.event_id, offsetMinutes: g.offset, sessionStartsAt: startsAtIso },
           text: ({ timeZone }) =>
             sessionReminderText({
               sessionName: s.name,
               sessionType: s.session_type,
               eventName: s.event_name,
-              startsAt: s.starts_at,
+              startsAt,
               timeZone,
               offsetMinutes: g.offset as ReminderOffset,
             }),

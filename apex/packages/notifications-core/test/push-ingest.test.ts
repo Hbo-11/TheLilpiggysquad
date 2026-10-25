@@ -11,6 +11,7 @@ import {
   signHmac,
   validateIngestUpdate,
   verifyHmacSignature,
+  isFreshTimestamp,
   type ExpoPushMessage,
   type FetchLike,
 } from '../src/index.ts'
@@ -166,4 +167,26 @@ test('HMAC webhook signatures', async () => {
   assert.equal(await verifyHmacSignature('other', body, sig), false)
   assert.equal(await verifyHmacSignature('s3cret', body, null), false)
   assert.equal(await verifyHmacSignature('s3cret', body, 'sha256=zz'), false)
+})
+
+test('a request-level rejection falls back to per-message sends so one bad token fails alone', async () => {
+  const fetch: FetchLike = async (_url, init) => {
+    const msgs = JSON.parse(init.body) as { to: string }[]
+    const foreign = msgs.some((m) => m.to.includes('foreign'))
+    if (foreign && msgs.length > 1) return { status: 400, json: async () => ({ errors: [{ code: 'PUSH_TOO_MANY_EXPERIENCE_IDS', message: 'mixed projects' }] }), text: async () => '' }
+    if (foreign) return { status: 400, json: async () => ({ errors: [{ code: 'VALIDATION_ERROR', message: 'bad' }] }), text: async () => '' }
+    return { status: 200, json: async () => ({ data: msgs.map((_, i) => ({ status: 'ok', id: `t${i}` })) }), text: async () => '' }
+  }
+  const results = await sendExpoPush([msg(1), { ...msg(2), to: 'ExponentPushToken[foreign0000]' }, msg(3)], { fetch })
+  assert.deepEqual(results.map((r) => r.status), ['ok', 'error', 'ok'])
+})
+
+test('signed timestamps must be recent', () => {
+  const now = new Date('2026-07-01T12:00:00Z')
+  const secs = (d: number) => String(Math.floor((now.getTime() + d) / 1000))
+  assert.equal(isFreshTimestamp(secs(0), now), true)
+  assert.equal(isFreshTimestamp(secs(-4 * 60_000), now), true)
+  assert.equal(isFreshTimestamp(secs(-6 * 60_000), now), false)
+  assert.equal(isFreshTimestamp(null, now), false)
+  assert.equal(isFreshTimestamp('abc', now), false)
 })

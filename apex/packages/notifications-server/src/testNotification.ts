@@ -1,5 +1,5 @@
 import { TEST_NOTIFICATION_LIMIT, dedupeKeys, testNotificationText } from '@apex/notifications-core'
-import type { Db } from './db.ts'
+import { inTransaction, type Db } from './db.ts'
 import { dispatchDeliveries, type DispatchSummary, type PushTransport } from './dispatch.ts'
 import { fanOut } from './fanout.ts'
 
@@ -17,23 +17,27 @@ export async function sendTestNotification(
   opts: { userId: string; now: Date; transport: PushTransport; requestId: string },
 ): Promise<TestNotificationResult> {
   const since = new Date(opts.now.getTime() - TEST_NOTIFICATION_LIMIT.windowMs)
-  const [{ count }] = await db<{ count: number }[]>`
-    select count(*)::int as count from public.notifications where user_id = ${opts.userId} and kind = 'test' and created_at > ${since}`
-  if (count >= TEST_NOTIFICATION_LIMIT.max) return { status: 'rate_limited' }
-
-  const fan = await fanOut(
-    db,
-    {
-      category: 'system',
-      kind: 'test',
-      dedupeKey: dedupeKeys.test(opts.requestId),
-      deepLink: '/settings/notifications',
-      data: { type: 'test' },
-      text: () => testNotificationText(),
-    },
-    [opts.userId],
-    { now: opts.now },
-  )
+  // Count and create under a per-user lock so parallel requests can't exceed the limit.
+  const fan = await inTransaction(db, async (tx) => {
+    await tx`select pg_advisory_xact_lock(hashtext(${'test-notification:' + opts.userId}))`
+    const [{ count }] = await tx<{ count: number }[]>`
+      select count(*)::int as count from public.notifications where user_id = ${opts.userId} and kind = 'test' and created_at > ${since}`
+    if (count >= TEST_NOTIFICATION_LIMIT.max) return null
+    return fanOut(
+      tx,
+      {
+        category: 'system',
+        kind: 'test',
+        dedupeKey: dedupeKeys.test(opts.requestId),
+        deepLink: '/settings/notifications',
+        data: { type: 'test' },
+        text: () => testNotificationText(),
+      },
+      [opts.userId],
+      { now: opts.now },
+    )
+  })
+  if (!fan) return { status: 'rate_limited' }
   const [n] = await db<{ id: string; push_note: string | null }[]>`
     select id, push_note from public.notifications where user_id = ${opts.userId} and dedupe_key = ${dedupeKeys.test(opts.requestId)}`
   if (!n) return { status: 'failed' }

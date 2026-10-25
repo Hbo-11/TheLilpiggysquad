@@ -15,7 +15,7 @@ describe('edge function handlers', { skip: skipNoDb }, () => {
     const expo = fakeExpo()
     const env: Record<string, string> = {
       APEX_INTERNAL_SECRET: INTERNAL,
-      INGEST_SOURCE_SECRETS: JSON.stringify({ [SOURCE]: 'provider-secret' }),
+      INGEST_SOURCE_SECRETS: JSON.stringify({ [SOURCE]: 'provider-secret-123' }),
       SUPABASE_URL: 'https://project.supabase.co',
       SUPABASE_ANON_KEY: 'anon',
     }
@@ -35,19 +35,29 @@ describe('edge function handlers', { skip: skipNoDb }, () => {
     userId = await createUser(sql, 'user@example.com')
   })
 
-  test('ingest requires a valid HMAC signature from a configured source', async () => {
+  test('ingest requires a fresh timestamp and a valid HMAC signature from a configured source', async () => {
     const body = JSON.stringify({ kind: 'event.upsert', externalRef: 'e1', championshipId: 'f1', name: 'Test GP', timezone: 'Europe/London', status: 'scheduled' })
-    const req = (headers: Record<string, string>) => new Request('http://x/ingest', { method: 'POST', body, headers })
-    assert.equal((await handleIngest(req({ 'x-apex-source': SOURCE }), deps())).status, 401)
-    assert.equal((await handleIngest(req({ 'x-apex-source': SOURCE, 'x-apex-signature': await signHmac('wrong', body) }), deps())).status, 401)
-    assert.equal((await handleIngest(req({ 'x-apex-source': 'other', 'x-apex-signature': await signHmac('provider-secret', body) }), deps())).status, 401)
-    const ok = await handleIngest(req({ 'x-apex-source': SOURCE, 'x-apex-signature': await signHmac('provider-secret', body) }), deps())
+    const ts = String(Math.floor(Date.now() / 1000))
+    const sign = (secret: string, t = ts, b = body) => signHmac(secret, `${t}.${b}`)
+    const req = (headers: Record<string, string>, b = body) => new Request('http://x/ingest', { method: 'POST', body: b, headers })
+    assert.equal((await handleIngest(req({ 'x-apex-source': SOURCE, 'x-apex-timestamp': ts }), deps())).status, 401)
+    assert.equal((await handleIngest(req({ 'x-apex-source': SOURCE, 'x-apex-timestamp': ts, 'x-apex-signature': await sign('wrong-secret-xxxxxxxx') }), deps())).status, 401)
+    assert.equal((await handleIngest(req({ 'x-apex-source': 'other', 'x-apex-timestamp': ts, 'x-apex-signature': await sign('provider-secret-123') }), deps())).status, 401)
+    // A body signed without the timestamp (or a replay of an old request) is refused.
+    assert.equal((await handleIngest(req({ 'x-apex-source': SOURCE, 'x-apex-timestamp': ts, 'x-apex-signature': await signHmac('provider-secret-123', body) }), deps())).status, 401)
+    const old = String(Math.floor(Date.now() / 1000) - 600)
+    assert.equal((await handleIngest(req({ 'x-apex-source': SOURCE, 'x-apex-timestamp': old, 'x-apex-signature': await sign('provider-secret-123', old) }), deps())).status, 401)
+    // Inherited properties never act as a secret.
+    const proto = String(Object)
+    assert.equal((await handleIngest(req({ 'x-apex-source': 'constructor', 'x-apex-timestamp': ts, 'x-apex-signature': await sign(proto) }), deps())).status, 401)
+
+    const ok = await handleIngest(req({ 'x-apex-source': SOURCE, 'x-apex-timestamp': ts, 'x-apex-signature': await sign('provider-secret-123') }), deps())
     assert.equal(ok.status, 200)
     assert.equal(((await ok.json()) as { results: { outcome: string }[] }).results[0].outcome, 'applied')
 
     const bad = JSON.stringify({ kind: 'session.upsert' })
     const rejected = await handleIngest(
-      new Request('http://x/ingest', { method: 'POST', body: bad, headers: { 'x-apex-source': SOURCE, 'x-apex-signature': await signHmac('provider-secret', bad) } }),
+      req({ 'x-apex-source': SOURCE, 'x-apex-timestamp': ts, 'x-apex-signature': await sign('provider-secret-123', ts, bad) }, bad),
       deps(),
     )
     assert.equal(rejected.status, 422)

@@ -10,6 +10,7 @@ import {
   type TrustLevel,
 } from '@apex/notifications-core'
 import { inTransaction, type Db } from './db.ts'
+import { cancelObsoleteReminders } from './reminders.ts'
 
 export type IngestOutcome =
   | { outcome: 'applied'; jobsQueued: number; detail?: Record<string, unknown> }
@@ -89,14 +90,16 @@ async function applyEvent(db: Db, sourceId: string, u: Extract<IngestUpdate, { k
   if (!champ) return { outcome: 'rejected', errors: ['unknown_championship'] }
   if (!champ.supported) return { outcome: 'rejected', errors: ['championship_not_supported'] }
 
-  const [existing] = await db<{ id: string; status: string }[]>`
-    select id, status from public.events where source_id = ${sourceId} and external_ref = ${u.externalRef}`
+  const [existing] = await db<{ id: string; status: string; source_updated_at: Date | null }[]>`
+    select id, status, source_updated_at from public.events where source_id = ${sourceId} and external_ref = ${u.externalRef} for update`
+  if (isStale(existing?.source_updated_at, u.sourceUpdatedAt)) return { outcome: 'rejected', errors: ['stale_update'] }
   const [event] = await db<{ id: string }[]>`
-    insert into public.events (source_id, external_ref, championship_id, name, circuit_name, country, timezone, status)
-    values (${sourceId}, ${u.externalRef}, ${u.championshipId}, ${u.name}, ${u.circuitName}, ${u.country}, ${u.timezone}, ${u.status})
+    insert into public.events (source_id, external_ref, championship_id, name, circuit_name, country, timezone, status, source_updated_at)
+    values (${sourceId}, ${u.externalRef}, ${u.championshipId}, ${u.name}, ${u.circuitName}, ${u.country}, ${u.timezone}, ${u.status}, ${u.sourceUpdatedAt})
     on conflict (source_id, external_ref) do update
       set championship_id = excluded.championship_id, name = excluded.name, circuit_name = excluded.circuit_name,
-          country = excluded.country, timezone = excluded.timezone, status = excluded.status, updated_at = now()
+          country = excluded.country, timezone = excluded.timezone, status = excluded.status,
+          source_updated_at = coalesce(excluded.source_updated_at, events.source_updated_at), updated_at = now()
     returning id`
 
   if (u.entries) {
@@ -132,6 +135,15 @@ async function applyEvent(db: Db, sourceId: string, u: Extract<IngestUpdate, { k
   return { outcome: 'applied', jobsQueued, detail: { eventId: event.id } }
 }
 
+/**
+ * Providers may re-deliver or reorder updates. When they include their own
+ * modification time, anything older than what we already applied is rejected,
+ * so a late copy can never put back an old session time.
+ */
+function isStale(stored: Date | null | undefined, incoming: string | null): boolean {
+  return !!stored && !!incoming && new Date(incoming).getTime() < stored.getTime()
+}
+
 async function queueSessionChange(
   db: Db,
   s: { id: string; schedule_version: number },
@@ -161,16 +173,17 @@ async function applySession(db: Db, sourceId: string, u: Extract<IngestUpdate, {
   if (!event) return { outcome: 'rejected', errors: ['unknown_event'] }
   const startsAt = u.startsAt ? new Date(u.startsAt) : null
 
-  const [existing] = await db<{ id: string; starts_at: Date | null; time_status: string; status: string; schedule_version: number; session_type: string; name: string }[]>`
-    select id, starts_at, time_status, status, schedule_version, session_type, name from public.event_sessions
+  const [existing] = await db<{ id: string; starts_at: Date | null; time_status: string; status: string; schedule_version: number; session_type: string; name: string; source_updated_at: Date | null }[]>`
+    select id, starts_at, time_status, status, schedule_version, session_type, name, source_updated_at from public.event_sessions
      where source_id = ${sourceId} and external_ref = ${u.externalRef} for update`
 
   if (!existing) {
     await db`
-      insert into public.event_sessions (event_id, source_id, external_ref, session_type, name, starts_at, local_start, timezone, time_status)
-      values (${event.id}, ${sourceId}, ${u.externalRef}, ${u.sessionType}, ${u.name}, ${startsAt}, ${u.localStart}, ${u.timezone}, ${u.timeStatus})`
+      insert into public.event_sessions (event_id, source_id, external_ref, session_type, name, starts_at, local_start, timezone, time_status, source_updated_at)
+      values (${event.id}, ${sourceId}, ${u.externalRef}, ${u.sessionType}, ${u.name}, ${startsAt}, ${u.localStart}, ${u.timezone}, ${u.timeStatus}, ${u.sourceUpdatedAt})`
     return { outcome: 'applied', jobsQueued: 0 }
   }
+  if (isStale(existing.source_updated_at, u.sourceUpdatedAt)) return { outcome: 'rejected', errors: ['stale_update'] }
 
   const timeChanged = (existing.starts_at?.getTime() ?? null) !== (startsAt?.getTime() ?? null)
   const statusChanged = existing.time_status !== u.timeStatus
@@ -181,7 +194,8 @@ async function applySession(db: Db, sourceId: string, u: Extract<IngestUpdate, {
   }
 
   let change: SessionChange | null = null
-  if (timeChanged && startsAt && u.timeStatus === 'confirmed') {
+  // A cancelled session stays cancelled until the provider says otherwise (session.status).
+  if (timeChanged && startsAt && u.timeStatus === 'confirmed' && existing.status !== 'cancelled') {
     change = existing.starts_at && existing.time_status === 'confirmed' ? 'rescheduled' : 'time_confirmed'
   }
   // A postponed session that gets a new confirmed time is back on.
@@ -192,22 +206,29 @@ async function applySession(db: Db, sourceId: string, u: Extract<IngestUpdate, {
            timezone = ${u.timezone}, time_status = ${u.timeStatus},
            status = case when ${reinstated} then 'scheduled' else status end,
            schedule_version = schedule_version + case when ${timeChanged || statusChanged} then 1 else 0 end,
+           source_updated_at = coalesce(${u.sourceUpdatedAt}::timestamptz, source_updated_at),
            last_verified_at = now(), updated_at = now()
      where id = ${existing.id}
     returning id, schedule_version`
+  // The time is no longer confirmed: reminders built on it must not go out. The app
+  // shows the session as provisional/TBC; no push claims a time we can't vouch for.
+  const lostConfirmation = existing.time_status === 'confirmed' && u.timeStatus !== 'confirmed'
+  const cancelled = lostConfirmation ? await cancelObsoleteReminders(db, s.id, null, false) : 0
   const jobsQueued = change ? await queueSessionChange(db, s, change, existing.starts_at, startsAt, now) : 0
-  return { outcome: 'applied', jobsQueued }
+  return cancelled ? { outcome: 'applied', jobsQueued, detail: { cancelledReminders: cancelled } } : { outcome: 'applied', jobsQueued }
 }
 
 async function applySessionStatus(db: Db, sourceId: string, u: Extract<IngestUpdate, { kind: 'session.status' }>, now: Date): Promise<IngestOutcome> {
-  const [existing] = await db<{ id: string; status: string; starts_at: Date | null; time_status: string }[]>`
-    select id, status, starts_at, time_status from public.event_sessions where source_id = ${sourceId} and external_ref = ${u.externalRef} for update`
+  const [existing] = await db<{ id: string; status: string; starts_at: Date | null; time_status: string; source_updated_at: Date | null }[]>`
+    select id, status, starts_at, time_status, source_updated_at from public.event_sessions where source_id = ${sourceId} and external_ref = ${u.externalRef} for update`
   if (!existing) return { outcome: 'rejected', errors: ['unknown_session'] }
+  if (isStale(existing.source_updated_at, u.sourceUpdatedAt)) return { outcome: 'rejected', errors: ['stale_update'] }
   if (existing.status === u.status) return { outcome: 'unchanged', jobsQueued: 0 }
   const bumpVersion = u.status === 'cancelled' || u.status === 'postponed' || (u.status === 'scheduled' && existing.status !== 'live')
   const [s] = await db<{ id: string; schedule_version: number }[]>`
     update public.event_sessions
-       set status = ${u.status}, schedule_version = schedule_version + ${bumpVersion ? 1 : 0}, last_verified_at = now(), updated_at = now()
+       set status = ${u.status}, schedule_version = schedule_version + ${bumpVersion ? 1 : 0},
+           source_updated_at = coalesce(${u.sourceUpdatedAt}::timestamptz, source_updated_at), last_verified_at = now(), updated_at = now()
      where id = ${existing.id}
     returning id, schedule_version`
   let jobsQueued = 0

@@ -2,7 +2,9 @@
 
 import {
   CATEGORY_INFO,
+  RATE_LIMITS,
   RETRY_POLICY,
+  evaluateRateLimit,
   getExpoReceipts,
   isCategoryEnabled,
   preferencesFromRow,
@@ -12,6 +14,7 @@ import {
   type FetchLike,
   type NotificationCategory,
   type PreferencesRow,
+  type RecentPush,
 } from '@apex/notifications-core'
 import { heartbeat, type Db } from './db.ts'
 
@@ -44,6 +47,7 @@ interface ClaimedDelivery {
   category: NotificationCategory
   attempts: number
   token: string
+  device_user_id: string
   device_invalidated: boolean
   title: string
   body: string
@@ -110,7 +114,7 @@ export async function dispatchDeliveries(
       returning d.*
     )
     select u.id, u.notification_id, u.user_id, u.device_id, u.category, u.attempts,
-           pd.expo_push_token as token, (pd.invalidated_at is not null) as device_invalidated,
+           pd.expo_push_token as token, pd.user_id as device_user_id, (pd.invalidated_at is not null) as device_invalidated,
            n.title, n.body, n.deep_link, n.kind, n.data, n.read_at, n.archived_at,
            to_jsonb(p.*) as prefs
       from u
@@ -125,7 +129,9 @@ export async function dispatchDeliveries(
   const sendable: ClaimedDelivery[] = []
   for (const d of claimed) {
     let reason: string | null = null
-    if (d.device_invalidated) reason = 'DEVICE_INVALIDATED'
+    // The token may have moved to another account since this delivery was queued.
+    if (d.device_user_id !== d.user_id) reason = 'DEVICE_REASSIGNED'
+    else if (d.device_invalidated) reason = 'DEVICE_INVALIDATED'
     else if (d.archived_at) reason = 'DISMISSED'
     else if (d.read_at) reason = 'ALREADY_READ'
     else if (d.category !== 'account_security' && d.category !== 'system') {
@@ -139,9 +145,18 @@ export async function dispatchDeliveries(
     } else sendable.push(d)
   }
 
-  const results = sendable.length ? await sendExpoPush(sendable.map((d) => toMessage(d, now)), opts.transport) : []
-  for (let i = 0; i < sendable.length; i++) {
-    const d = sendable[i]
+  // Rate limits again at send time, counting what was actually sent in the last hour.
+  // Without this, pushes held overnight would all be released together when quiet hours end.
+  const rateLimited = await applySendTimeRateLimits(db, sendable, now)
+  for (const d of sendable.filter((x) => rateLimited.has(x.notification_id))) {
+    await db`update public.notification_deliveries set status = 'cancelled', error_code = 'RATE_LIMITED' where id = ${d.id}`
+    summary.cancelled++
+  }
+  const toSend = sendable.filter((x) => !rateLimited.has(x.notification_id))
+
+  const results = toSend.length ? await sendExpoPush(toSend.map((d) => toMessage(d, now)), opts.transport) : []
+  for (let i = 0; i < toSend.length; i++) {
+    const d = toSend[i]
     const r = results[i]
     if (r.status === 'ok') {
       await db`update public.notification_deliveries set status = 'sent', ticket_id = ${r.ticketId}, error_code = null, error_message = null where id = ${d.id}`
@@ -167,8 +182,38 @@ export async function dispatchDeliveries(
 
   const touched = [...new Set(claimed.map((d) => d.notification_id))]
   if (touched.length) await refreshPushState(db, touched)
+  if (rateLimited.size) {
+    await db`
+      update public.notifications set push_state = 'suppressed', push_note = 'overall_rate_limited'
+       where id = any(${[...rateLimited]}::uuid[]) and push_state <> 'sent'`
+  }
   await heartbeat(db, 'dispatch', { ...summary, pushConfigured: true }, now)
   return summary
+}
+
+/** Returns the notification ids whose push must be dropped because the user's push budget is used up. */
+async function applySendTimeRateLimits(db: Db, deliveries: ClaimedDelivery[], now: Date): Promise<Set<string>> {
+  const limited = new Set<string>()
+  if (deliveries.length === 0) return limited
+  const userIds = [...new Set(deliveries.map((d) => d.user_id))]
+  const since = new Date(now.getTime() - RATE_LIMITS.windowMs)
+  const rows = await db<{ user_id: string; category: NotificationCategory; at: Date }[]>`
+    select user_id, category, max(last_attempt_at) as at from public.notification_deliveries
+     where user_id = any(${userIds}::uuid[]) and status in ('sent', 'delivered') and last_attempt_at > ${since}
+     group by user_id, notification_id, category`
+  const recent = new Map<string, RecentPush[]>()
+  for (const r of rows) recent.set(r.user_id, [...(recent.get(r.user_id) ?? []), { category: r.category, at: r.at }])
+  const decided = new Set<string>()
+  for (const d of deliveries) {
+    if (decided.has(d.notification_id)) continue // one decision per notification, however many devices
+    decided.add(d.notification_id)
+    const list = recent.get(d.user_id) ?? []
+    if (evaluateRateLimit({ category: d.category, recentPushes: list, now }).allowed) {
+      list.push({ category: d.category, at: now })
+      recent.set(d.user_id, list)
+    } else limited.add(d.notification_id)
+  }
+  return limited
 }
 
 async function invalidateDevice(db: Db, deviceId: string, reason: string) {

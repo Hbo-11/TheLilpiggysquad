@@ -62,6 +62,7 @@ Security properties (each covered by `packages/notifications-server/test/databas
 
 - RLS is enabled on every table. Server-only tables have all privileges revoked from `anon` and `authenticated`, on top of Supabase's broad defaults.
 - Clients cannot insert, rewrite or delete notifications. They can only mark their own as read or archived.
+- Preference categories must be known category names with true/false values, enforced by a check constraint. A malformed value saved by one user therefore can't break reminder queries for everyone else.
 - Push tokens are written only by `register_push_device`, which binds the token to `auth.uid()`. If the token was registered to another account, it moves and that account's queued pushes are cancelled. `my_push_devices` shows only the last 4 characters of each token.
 - Sending is server-only. Edge Functions authenticate with `APEX_INTERNAL_SECRET` (workers and services) or a per-provider HMAC signature (ingest). The test-notification function sends only to the caller's own devices and is rate limited.
 - No secrets ship in the app: only the Supabase URL and anon key, which RLS protects.
@@ -70,7 +71,7 @@ Security properties (each covered by `packages/notifications-server/test/databas
 
 ## Processing pipeline
 
-`process-notifications` runs every minute:
+`process-notifications` runs every minute. Its three stages (jobs, reminders, dispatch) run independently, so a failure in one is logged and the others still run.
 
 1. **Jobs.** Claims queued jobs with `FOR UPDATE SKIP LOCKED`, so several workers are safe. Failures retry with exponential backoff up to 5 attempts, then the job is marked `failed` with its error. A crashed worker's jobs are re-queued after 10 minutes.
    - `session_change`: rescheduled, time confirmed, postponed, cancelled or live. It cancels obsolete reminders, then notifies the session's audience.
@@ -81,7 +82,13 @@ Security properties (each covered by `packages/notifications-server/test/databas
 2. **Reminder scan.** `reminder_candidates(from, to)` finds every (user, session, offset) whose fire time falls in the window since the last scan. It always uses the session's current start time, so a rescheduled session needs no per-user schedule maintenance. Reminders more than 10 minutes late (for example after an outage) are skipped and recorded in the heartbeat rather than sent stale.
 3. **Fan-out** (`fanOut`, used by every path), for each recipient:
    preferences → timezone → quiet hours → rate limit → collapse → insert the notification (`ON CONFLICT DO NOTHING`) → create a delivery per active device.
-4. **Dispatch.** Sends due deliveries in batches of 100. At send time it re-checks preferences, the push switch, whether the user already read or dismissed the notification in the app, and whether the device is still valid.
+4. **Dispatch.** Sends due deliveries in batches of 100. At send time it re-checks:
+   - preferences and the push switch
+   - whether the user already read or dismissed the notification in the app
+   - whether the device is still valid and still belongs to the same user
+   - the rate limits
+
+   If Expo rejects a whole batch (for example one token from a different Expo project), each message is retried on its own, so only the bad one fails.
    - Transient errors (network, 429, 5xx) retry with backoff.
    - `DeviceNotRegistered` invalidates the device.
    - A send whose result was never recorded is marked `UNKNOWN_OUTCOME` rather than resent, to avoid duplicates.
@@ -99,7 +106,8 @@ Security properties (each covered by `packages/notifications-server/test/databas
 - One reminder per (session, start time, timing) for each user, whichever follows matched. Duplicate timings never produce two reminders for the same moment.
 - Only sessions whose `time_status` is `confirmed` get reminders. Provisional and TBC times are labelled as such in the app and never trigger an alert.
 - **Reschedule**: a new start time means new dedupe keys. Held reminders for the old time are cancelled and unread ones archived, and followers get a "rescheduled" notification showing the new and old times in their timezone. Changes are pushed for sessions within 21 days; further-out calendar moves are treated as news.
-- **Postponed or cancelled**: no further reminders, and followers are notified. Cancelling a whole event cascades to its sessions.
+- **Postponed or cancelled**: no further reminders, and followers are notified. Cancelling a whole event cascades to its sessions. A new time for a cancelled session is stored but not announced until the provider reinstates the session.
+- **Confirmed time withdrawn** (back to provisional or TBC): reminders already created for it are cancelled and archived at once. No push claims a time that is no longer confirmed.
 - **Session started**: sent only to users who chose "at session start" and haven't already had that reminder.
 - Each device gets reminders through exactly one mechanism. Registered devices get them from the server. Devices with permission but no server registration use local scheduling, reconciled whenever the app opens or a schedule-change push arrives. Devices without permission see them in the app only.
 - Local scheduling currently covers followed championships only. Reminders from driver and team follows and saved events need server push. iOS keeps at most 64 pending local notifications, so the app schedules the 60 soonest.
@@ -117,6 +125,8 @@ Security properties (each covered by `packages/notifications-server/test/databas
 - Nothing is silently discarded: anything not pushed is still in the notification centre, with a note explaining why.
 
 **Rate limits** (per user, rolling hour): at most 8 pushes overall, plus per-category caps, for example 2 major headlines and 6 session reminders. Over the limit, the notification is still created in-app with the note "Not pushed: notification limit reached". Security and system messages are exempt.
+
+The limits are checked twice: when the notification is created, and again at send time against what was actually sent in the last hour. The second check stops pushes held overnight from all arriving together when quiet hours end.
 
 **Collapsing**: news items with the same `storyKey` within 6 hours update one notification ("3 updates on this story") instead of adding more, with one push. Schedule changes are never collapsed, because each carries a new time.
 
@@ -244,12 +254,16 @@ No provider is connected in this repository, and no schedule, result or announce
 2. Give the provider their secret (from `INGEST_SOURCE_SECRETS`) and the endpoint `https://<ref>.supabase.co/functions/v1/ingest-motorsport-update`.
 3. Each request is a JSON update, or an array of up to 200. Headers:
    - `x-apex-source: <source id>`
-   - `x-apex-signature: sha256=<hex HMAC-SHA256 of the raw body>`
+   - `x-apex-timestamp: <unix seconds>`: must be within 5 minutes of the server clock, so a captured request can't be replayed later
+   - `x-apex-signature: sha256=<hex HMAC-SHA256 of "<timestamp>.<raw body>">`
+
+   Secrets must be at least 16 characters. Include `updatedAt` (the provider's own modification time) on `event.upsert`, `session.upsert` and `session.status`. Any update older than one already applied is then rejected as `stale_update`, so re-delivered or out-of-order messages can't put back an old session time.
 
 ```bash
-BODY='{"kind":"session.upsert","externalRef":"2026-gbr-q","eventExternalRef":"2026-gbr","sessionType":"qualifying","name":"Qualifying","localStart":"2026-07-04T15:00","timezone":"Europe/London","timeStatus":"confirmed"}'
-SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | sed 's/^.* //')
-curl -X POST "$URL/ingest-motorsport-update" -H "x-apex-source: acme-timing" -H "x-apex-signature: sha256=$SIG" -d "$BODY"
+BODY='{"kind":"session.upsert","externalRef":"2026-gbr-q","eventExternalRef":"2026-gbr","sessionType":"qualifying","name":"Qualifying","localStart":"2026-07-04T15:00","timezone":"Europe/London","timeStatus":"confirmed","updatedAt":"2026-07-01T09:00:00Z"}'
+TS=$(date +%s)
+SIG=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | sed 's/^.* //')
+curl -X POST "$URL/ingest-motorsport-update" -H "x-apex-source: acme-timing" -H "x-apex-timestamp: $TS" -H "x-apex-signature: sha256=$SIG" -d "$BODY"
 ```
 
 | kind | Required fields | Effect |
@@ -315,6 +329,7 @@ Coverage of the required test areas:
 | Logout and token cleanup | mobile `logic` › logout order, offline logout; `database-security` › unregistering, release by token, account deletion; `pipeline` › logout removes the device |
 | Deep-link navigation | `preferences-links-content` › allow-listed destinations, never Home; mobile `logic` › local reminder deep link; Playwright run of the web build (below) |
 | Database access control | `database-security` (16 tests) |
+| Review regressions | `pipeline` › token moved during retry or in-flight send, confirmed time withdrawn, held pushes rate limited at release, same resource id for two users, out-of-order provider updates, cancelled session not "rescheduled", crash-looping job, test notification in quiet hours; `http` › replayed or unsigned-timestamp requests, inherited-property source ids; `push-ingest` › per-message fallback; `reminders` › dedupe keys never collide |
 | Retry behaviour | `pipeline` › temporary push failures are retried with backoff; failed jobs are retried |
 | Failed delivery logging | `pipeline` › receipt errors are logged; `push-ingest` › transport failures |
 

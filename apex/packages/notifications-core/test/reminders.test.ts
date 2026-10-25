@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  dedupeKeys,
   limitLocalReminders,
   planSessionReminders,
   reconcileLocalReminders,
@@ -132,4 +133,12 @@ test('limits local reminders to the soonest ones (iOS caps pending notifications
   const limited = limitLocalReminders(many.reverse())
   assert.equal(limited.length, 60)
   assert.equal(limited[0].sessionId, 's0')
+})
+
+test('dedupe keys never collide for different ids', () => {
+  assert.notEqual(dedupeKeys.article('src', 'a b'), dedupeKeys.article('src', 'a_b'))
+  assert.notEqual(dedupeKeys.article('src', 'x'.repeat(100) + '1'), dedupeKeys.article('src', 'x'.repeat(100) + '2'))
+  assert.notEqual(dedupeKeys.article('a:b', 'c'), dedupeKeys.article('a', 'b:c'))
+  assert.equal(dedupeKeys.article('src', 'plain-id_1'), 'article:src:plain-id_1')
+  assert.ok(dedupeKeys.article('s'.repeat(40), 'r'.repeat(100)).length <= 200)
 })

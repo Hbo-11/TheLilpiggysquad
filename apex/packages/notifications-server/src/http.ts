@@ -1,7 +1,7 @@
 // Request handlers for the Supabase Edge Functions. They use only Web-standard
 // Request/Response so the same code runs in Deno (production) and Node (tests).
 
-import { APP_EVENT_KINDS, verifyHmacSignature, type AppEventKind, type FetchLike } from '@apex/notifications-core'
+import { APP_EVENT_KINDS, isFreshTimestamp, signedPayload, verifyHmacSignature, type AppEventKind, type FetchLike } from '@apex/notifications-core'
 import type { Db } from './db.ts'
 import { checkReceipts, dispatchDeliveries, type PushTransport } from './dispatch.ts'
 import { ingestUpdate } from './ingest.ts'
@@ -60,7 +60,9 @@ async function authenticatedUserId(req: Request, deps: HandlerDeps): Promise<str
 
 /**
  * POST /ingest-motorsport-update
- * Headers: x-apex-source: <data_sources.id>, x-apex-signature: sha256=<hex HMAC of body>
+ * Headers: x-apex-source: <data_sources.id>
+ *          x-apex-timestamp: <unix seconds, within 5 minutes of now>
+ *          x-apex-signature: sha256=<hex HMAC-SHA256 of "<timestamp>.<raw body>">
  * Secrets per source come from INGEST_SOURCE_SECRETS (JSON object {sourceId: secret}).
  */
 export async function handleIngest(req: Request, deps: HandlerDeps): Promise<Response> {
@@ -72,10 +74,14 @@ export async function handleIngest(req: Request, deps: HandlerDeps): Promise<Res
   } catch {
     return json(500, { error: 'ingest_not_configured' })
   }
-  const secret = secrets[sourceId]
+  // Own string properties only: "constructor", "__proto__" etc. must never resolve to a secret.
+  const secret = Object.hasOwn(secrets, sourceId) && typeof secrets[sourceId] === 'string' ? secrets[sourceId] : null
   const body = await readBody(req)
   if (body === null) return json(413, { error: 'payload_too_large' })
-  if (!secret || !(await verifyHmacSignature(secret, body, req.headers.get('x-apex-signature')))) {
+  const now = deps.now?.() ?? new Date()
+  const timestamp = req.headers.get('x-apex-timestamp')
+  if (!isFreshTimestamp(timestamp, now)) return json(401, { error: 'stale_or_missing_timestamp' })
+  if (!secret || secret.length < 16 || !(await verifyHmacSignature(secret, signedPayload(timestamp!, body), req.headers.get('x-apex-signature')))) {
     return json(401, { error: 'invalid_signature' })
   }
   let payload: unknown
@@ -85,21 +91,31 @@ export async function handleIngest(req: Request, deps: HandlerDeps): Promise<Res
     return json(400, { error: 'invalid_json' })
   }
   const updates = Array.isArray(payload) ? payload.slice(0, 200) : [payload]
-  const now = deps.now?.() ?? new Date()
   const results = []
   for (const u of updates) results.push(await ingestUpdate(deps.db, { sourceId, payload: u, now }))
   const rejected = results.filter((r) => r.outcome === 'rejected').length
   return json(rejected === results.length ? 422 : 200, { results })
 }
 
+/** Run one worker stage; a failure is logged and reported but never blocks the other stages. */
+async function stage<T>(name: string, fn: () => Promise<T>): Promise<T | { error: string }> {
+  try {
+    return await fn()
+  } catch (err) {
+    console.error(`notification stage ${name} failed`, err)
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 /** POST /process-notifications (cron, every minute): jobs, reminders, then dispatch. */
 export async function handleProcess(req: Request, deps: HandlerDeps): Promise<Response> {
   if (!isInternal(req, deps)) return json(401, { error: 'unauthorized' })
   const now = deps.now?.() ?? new Date()
-  const jobs = await processJobs(deps.db, { now })
-  const reminders = await scanReminders(deps.db, { now })
-  const dispatch = await dispatchDeliveries(deps.db, { now, transport: transport(deps) })
-  return json(200, { jobs, reminders, dispatch })
+  const jobs = await stage('jobs', () => processJobs(deps.db, { now }))
+  const reminders = await stage('reminders', () => scanReminders(deps.db, { now }))
+  const dispatch = await stage('dispatch', () => dispatchDeliveries(deps.db, { now, transport: transport(deps) }))
+  const failed = [jobs, reminders, dispatch].some((r) => 'error' in r)
+  return json(failed ? 500 : 200, { jobs, reminders, dispatch })
 }
 
 /** POST /check-push-receipts (cron, every 15 minutes). */

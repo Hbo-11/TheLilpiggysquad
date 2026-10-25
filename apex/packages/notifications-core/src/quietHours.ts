@@ -48,7 +48,8 @@ export function decideQuietHours(input: {
 }): DeliveryDecision {
   const { category, now, quietHours, timeZone } = input
   const priority = CATEGORY_INFO[category].priority
-  if (priority === 'critical') return { action: 'send_now' }
+  // Security alerts, and test notifications the user just asked for, are never held.
+  if (priority === 'critical' || category === 'system') return { action: 'send_now' }
   if (!isInQuietHours(now, quietHours, timeZone)) return { action: 'send_now' }
 
   const until = quietHoursEndAfter(now, quietHours, timeZone)

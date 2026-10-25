@@ -134,16 +134,23 @@ async function fanOutChunk(db: Db, spec: NotificationSpec, ids: string[], now: D
         result.duplicates++
         continue
       }
-      const count = target.group_count + 1
-      const text = (spec.collapsedText ?? spec.text)({ timeZone: decision.timeZone, count })
       // A collapsed update refreshes the existing entry and marks it unread, without a new push.
-      await db`
+      // Increment in SQL (row-locked) so concurrent jobs can't lose a count or merge twice.
+      const [merged] = await db<{ group_count: number }[]>`
         update public.notifications
-           set group_count = ${count},
-               title = ${truncate(text.title, TITLE_MAX)},
-               body = ${truncate(text.body, BODY_MAX)},
+           set group_count = group_count + 1,
                read_at = null,
                data = jsonb_set(data, '{mergedKeys}', coalesce(data -> 'mergedKeys', '[]'::jsonb) || to_jsonb(${spec.dedupeKey}::text))
+         where id = ${target.id} and dedupe_key <> ${spec.dedupeKey}
+           and not coalesce(data -> 'mergedKeys', '[]'::jsonb) ? ${spec.dedupeKey}
+        returning group_count`
+      if (!merged) {
+        result.duplicates++
+        continue
+      }
+      const text = (spec.collapsedText ?? spec.text)({ timeZone: decision.timeZone, count: merged.group_count })
+      await db`
+        update public.notifications set title = ${truncate(text.title, TITLE_MAX)}, body = ${truncate(text.body, BODY_MAX)}
          where id = ${target.id}`
       result.collapsed++
       continue

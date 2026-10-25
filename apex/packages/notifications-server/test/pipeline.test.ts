@@ -3,7 +3,7 @@
 
 import { after, beforeEach, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { dedupeKeys } from '@apex/notifications-core'
+import { RATE_LIMITS, dedupeKeys } from '@apex/notifications-core'
 import {
   checkReceipts,
   dispatchDeliveries,
@@ -417,5 +417,120 @@ describe('notification pipeline', { skip: skipNoDb }, () => {
     const r = await scanReminders(sql, { now: minutesBefore(QUALI_START, 15) })
     assert.ok(r.missedWindow)
     assert.equal(r.created, 0)
+  })
+
+  // ---- Regressions from the backend review ----
+
+  test('a token moved to another account never receives the previous owner\'s retried push', async () => {
+    const now = at('2026-07-01T12:00:00Z')
+    await queueAppEvent(sql, { userId: fan, kind: 'report_ready', resourceId: 'r1', now })
+    await processJobs(sql, { now })
+    // First attempt fails transiently, so the delivery goes back to pending...
+    await dispatchDeliveries(sql, { now, transport: { fetch: fakeExpo({ httpStatus: () => 503 }).fetch }, random: () => 0.5 })
+    // ...and meanwhile the phone signs in to the stranger's account.
+    await asUser(sql, stranger, (tx) => tx`select public.register_push_device(${token(1)}, 'ios')`)
+    const expo = fakeExpo()
+    const d = await dispatchDeliveries(sql, { now: new Date(now.getTime() + 60 * 60_000), transport: { fetch: expo.fetch } })
+    assert.equal(expo.sent.length, 0)
+    assert.equal(d.sent, 0)
+    const [row] = await sql`select status, error_code from public.notification_deliveries`
+    assert.deepEqual({ ...row }, { status: 'cancelled', error_code: 'DEVICE_REASSIGNED' })
+  })
+
+  test('a token moved while a send is in flight cannot be re-sent to the new owner', async () => {
+    const now = at('2026-07-01T12:00:00Z')
+    await queueAppEvent(sql, { userId: fan, kind: 'report_ready', resourceId: 'r1', now })
+    await processJobs(sql, { now })
+    await sql`update public.notification_deliveries set status = 'sending', last_attempt_at = ${now}`
+    await asUser(sql, stranger, (tx) => tx`select public.register_push_device(${token(1)}, 'ios')`)
+    const [row] = await sql`select status from public.notification_deliveries`
+    assert.equal(row.status, 'cancelled')
+  })
+
+  test('a confirmed time that becomes provisional cancels reminders built on it', async () => {
+    await seedWeekend()
+    await sql`update public.notification_preferences
+                 set reminder_offsets = '{1440}', quiet_hours_enabled = true, quiet_hours_start = '13:00', quiet_hours_end = '16:00' where user_id = ${fan}`
+    await scanReminders(sql, { now: minutesBefore(QUALI_START, 1439) }) // 15:01 BST on the 3rd: held until 16:00
+    const [held] = await sql`select status from public.notification_deliveries d join public.notifications n on n.id = d.notification_id where n.user_id = ${fan}`
+    assert.equal(held.status, 'pending')
+    const res = await ingest(
+      { kind: 'session.upsert', externalRef: 'gbr-2026-q', eventExternalRef: 'gbr-2026', sessionType: 'qualifying', name: 'Qualifying',
+        localStart: '2026-07-06T15:00', timezone: 'Europe/London', timeStatus: 'provisional' },
+      minutesBefore(QUALI_START, 1430),
+    )
+    assert.equal(res.outcome, 'applied')
+    const [after] = await sql`select d.status, n.archived_at from public.notification_deliveries d join public.notifications n on n.id = d.notification_id where n.user_id = ${fan}`
+    assert.equal(after.status, 'cancelled')
+    assert.ok(after.archived_at)
+    const sent = await dispatchDeliveries(sql, { now: minutesBefore(QUALI_START, 1300), transport: { fetch: fakeExpo().fetch } })
+    assert.equal(sent.sent, 0)
+  })
+
+  test('pushes held overnight are still rate limited when quiet hours end', async () => {
+    await sql`update public.notification_preferences set quiet_hours_enabled = true, quiet_hours_start = '22:00', quiet_hours_end = '07:00' where user_id = ${fan}`
+    // Five AI results per hour for seven hours: each hour is within the creation-time limits.
+    for (let h = 0; h < 7; h++) {
+      const now = new Date(at('2026-07-01T21:30:00Z').getTime() + h * 60 * 60_000)
+      for (let i = 0; i < 5; i++) await queueAppEvent(sql, { userId: fan, kind: 'report_ready', resourceId: `r${h}-${i}`, now })
+      await processJobs(sql, { now })
+    }
+    const expo = fakeExpo()
+    const d = await dispatchDeliveries(sql, { now: at('2026-07-02T06:01:00Z'), transport: { fetch: expo.fetch } })
+    assert.equal(expo.sent.length, RATE_LIMITS.perCategoryPerWindow.ai_tasks)
+    assert.equal(d.sent + d.cancelled, d.claimed)
+    const [{ c }] = await sql`select count(*)::int as c from public.notifications where user_id = ${fan} and push_note = 'overall_rate_limited'`
+    assert.equal(c, d.cancelled, 'skipped pushes stay in-app with an explanation')
+  })
+
+  test('app events for two users with the same resource id are both delivered', async () => {
+    const now = at('2026-07-01T12:00:00Z')
+    assert.equal(await queueAppEvent(sql, { userId: fan, kind: 'analysis_completed', resourceId: 'job-1', now }), true)
+    assert.equal(await queueAppEvent(sql, { userId: driverFan, kind: 'analysis_completed', resourceId: 'job-1', now }), true)
+    assert.equal(await queueAppEvent(sql, { userId: fan, kind: 'analysis_completed', resourceId: 'job-1', now }), false, 'still idempotent per user')
+    await processJobs(sql, { now })
+    assert.equal((await notificationsFor(fan)).length, 1)
+    assert.equal((await notificationsFor(driverFan)).length, 1)
+  })
+
+  test('out-of-order provider updates cannot put back an old session time', async () => {
+    await seedWeekend()
+    const now = at('2026-07-03T09:00:00Z')
+    const base = { kind: 'session.upsert', externalRef: 'gbr-2026-q', eventExternalRef: 'gbr-2026', sessionType: 'qualifying', name: 'Qualifying', timezone: 'Europe/London', timeStatus: 'confirmed' }
+    assert.equal((await ingest({ ...base, localStart: '2026-07-04T17:00', updatedAt: '2026-07-03T08:00:00Z' }, now)).outcome, 'applied')
+    const replay = await ingest({ ...base, localStart: '2026-07-04T15:00', updatedAt: '2026-07-02T08:00:00Z' }, now)
+    assert.deepEqual(replay, { outcome: 'rejected', errors: ['stale_update'] })
+    const [s] = await sql`select starts_at from public.event_sessions where external_ref = 'gbr-2026-q'`
+    assert.equal(s.starts_at.toISOString(), '2026-07-04T16:00:00.000Z')
+    const staleStatus = await ingest({ kind: 'session.status', externalRef: 'gbr-2026-q', status: 'cancelled', updatedAt: '2026-07-01T00:00:00Z' }, now)
+    assert.deepEqual(staleStatus, { outcome: 'rejected', errors: ['stale_update'] })
+  })
+
+  test('a new time for a cancelled session does not announce a reschedule', async () => {
+    await seedWeekend()
+    const now = at('2026-07-03T09:00:00Z')
+    await ingest({ kind: 'session.status', externalRef: 'gbr-2026-q', status: 'cancelled' }, now)
+    const r = await ingest(
+      { kind: 'session.upsert', externalRef: 'gbr-2026-q', eventExternalRef: 'gbr-2026', sessionType: 'qualifying', name: 'Qualifying',
+        localStart: '2026-07-04T17:00', timezone: 'Europe/London', timeStatus: 'confirmed' },
+      now,
+    )
+    assert.deepEqual(r, { outcome: 'applied', jobsQueued: 0 })
+  })
+
+  test('a job that keeps crashing the worker is eventually marked failed', async () => {
+    const now = at('2026-07-01T12:00:00Z')
+    await sql`insert into public.notification_jobs (job_type, payload, idempotency_key, status, attempts, locked_at)
+              values ('app_event', '{}', 'crash-1', 'processing', 5, ${new Date(now.getTime() - 20 * 60_000)})`
+    await processJobs(sql, { now })
+    const [job] = await sql`select status, last_error from public.notification_jobs where idempotency_key = 'crash-1'`
+    assert.equal(job.status, 'failed')
+    assert.match(job.last_error, /Worker stopped/)
+  })
+
+  test('test notifications are sent straight away even during quiet hours', async () => {
+    await sql`update public.notification_preferences set quiet_hours_enabled = true, quiet_hours_start = '00:00', quiet_hours_end = '23:59' where user_id = ${fan}`
+    const r = await sendTestNotification(sql, { userId: fan, now: at('2026-07-01T12:00:00Z'), transport: { fetch: fakeExpo().fetch }, requestId: 'q1' })
+    assert.equal(r.status, 'sent')
   })
 })

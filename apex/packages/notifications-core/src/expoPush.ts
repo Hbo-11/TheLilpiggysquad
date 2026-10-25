@@ -96,6 +96,13 @@ export async function sendExpoPush(
       continue
     }
     if (res.status >= 400 || !Array.isArray(payload.data)) {
+      // A request-level rejection (e.g. one token from a different Expo project) would
+      // otherwise fail everyone in the batch. Retry each message on its own so only
+      // the offending message fails.
+      if (chunk.length > 1) {
+        for (const m of chunk) results.push(...(await sendExpoPush([m], opts)))
+        continue
+      }
       const err = payload.errors?.[0]
       results.push(...chunk.map(() => classify(err?.code ?? `HTTP_${res.status}`, err?.message ?? 'Request rejected')))
       continue

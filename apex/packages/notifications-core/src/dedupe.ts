@@ -2,10 +2,28 @@
 // on notifications, so creating the same notification twice (a retried job, a second
 // matching follow, a re-run of the reminder scan) is a no-op.
 
-const SAFE = /[^A-Za-z0-9_.:@-]/g
+const SAFE = /^[A-Za-z0-9_.@-]{1,100}$/
 
+/** FNV-1a, two seeds (64 bits): enough to keep distinct ids apart in a key. */
+function hash(value: string): string {
+  let a = 0x811c9dc5
+  let b = 0x01000193 ^ value.length
+  for (let i = 0; i < value.length; i++) {
+    const c = value.charCodeAt(i)
+    a = Math.imul(a ^ c, 0x01000193)
+    b = Math.imul(b ^ c, 0x5bd1e995)
+  }
+  return (a >>> 0).toString(36) + (b >>> 0).toString(36)
+}
+
+/**
+ * Key component. Safe values up to 100 characters are used as-is; anything else
+ * (unusual characters, long values) gets a hash so different ids never collide.
+ */
 function part(value: string | number): string {
-  return String(value).replace(SAFE, '_').slice(0, 80)
+  const v = String(value)
+  if (SAFE.test(v)) return v
+  return `${v.replace(/[^A-Za-z0-9_.@-]/g, '').slice(0, 40)}~${hash(v)}`
 }
 
 export const dedupeKeys = {
@@ -14,7 +32,7 @@ export const dedupeKeys = {
    * reminders for the obsolete time can be cancelled.
    */
   sessionReminder(sessionId: string, startsAtIso: string, offsetMinutes: number): string {
-    return `reminder:${part(sessionId)}:${part(new Date(startsAtIso).toISOString())}:${offsetMinutes}`
+    return `reminder:${part(sessionId)}:${new Date(startsAtIso).getTime()}:${offsetMinutes}`
   },
   scheduleChange(sessionId: string, scheduleVersion: number): string {
     return `schedule:${part(sessionId)}:v${scheduleVersion}`

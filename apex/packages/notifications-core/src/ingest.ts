@@ -37,6 +37,8 @@ export type IngestUpdate =
       timezone: string
       status: EventStatus
       entries: EntryInput[] | null
+      /** Provider's own modification time; used to reject out-of-order or replayed updates. */
+      sourceUpdatedAt: string | null
     }
   | {
       kind: 'session.upsert'
@@ -50,8 +52,9 @@ export type IngestUpdate =
       /** Event-local wall time as published by the source, kept for display/audit. */
       localStart: string | null
       timezone: string | null
+      sourceUpdatedAt: string | null
     }
-  | { kind: 'session.status'; externalRef: string; status: SessionStatus }
+  | { kind: 'session.status'; externalRef: string; status: SessionStatus; sourceUpdatedAt: string | null }
   | { kind: 'results.published'; sessionExternalRef: string; resultsUrl: string | null }
   | {
       kind: 'announcement'
@@ -145,6 +148,10 @@ class Checker {
     }
     return v
   }
+  optInstant(key: string): string | null {
+    const v = this.src[key]
+    return v === undefined || v === null ? null : this.instant(key)
+  }
   instant(key: string): string {
     const d = parseInstant(this.src[key])
     if (!d) {
@@ -204,6 +211,7 @@ export function validateIngestUpdate(input: unknown): IngestValidation {
         timezone,
         status: c.oneOf<EventStatus>('status', ['scheduled', 'postponed', 'cancelled', 'completed']),
         entries,
+        sourceUpdatedAt: c.optInstant('updatedAt'),
       }
       break
     }
@@ -248,6 +256,7 @@ export function validateIngestUpdate(input: unknown): IngestValidation {
         timeStatus,
         localStart,
         timezone,
+        sourceUpdatedAt: c.optInstant('updatedAt'),
       }
       break
     }
@@ -256,6 +265,7 @@ export function validateIngestUpdate(input: unknown): IngestValidation {
         kind,
         externalRef: c.ref('externalRef'),
         status: c.oneOf<SessionStatus>('status', ['scheduled', 'live', 'finished', 'cancelled', 'postponed']),
+        sourceUpdatedAt: c.optInstant('updatedAt'),
       }
       break
     case 'results.published':
@@ -301,6 +311,19 @@ export function validateIngestUpdate(input: unknown): IngestValidation {
     }
   }
   return c.errors.length ? { ok: false, errors: c.errors } : { ok: true, update }
+}
+
+/** How far a signed request's timestamp may be from the server clock. */
+export const INGEST_MAX_CLOCK_SKEW_MS = 5 * 60_000
+
+/** The string providers sign: "<unix seconds>.<raw body>" (timestamp prevents replaying old requests). */
+export function signedPayload(timestampSeconds: string, body: string): string {
+  return `${timestampSeconds}.${body}`
+}
+
+export function isFreshTimestamp(header: string | null, now: Date): boolean {
+  if (!header || !/^\d{9,11}$/.test(header)) return false
+  return Math.abs(Number(header) * 1000 - now.getTime()) <= INGEST_MAX_CLOCK_SKEW_MS
 }
 
 /** Constant-time comparison of hex HMAC signatures for the ingest webhook. */

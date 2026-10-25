@@ -83,6 +83,10 @@ describe('database security', { skip: skipNoDb }, () => {
 
   test('preference constraints reject invalid values', async () => {
     const bad = [
+      // Non-boolean or unknown category values would break server queries for everyone.
+      sql`update public.notification_preferences set categories = categories || '{"race_reminders": "lol"}' where user_id = ${alice}`,
+      sql`update public.notification_preferences set categories = categories || '{"made_up": true}' where user_id = ${alice}`,
+      sql`update public.notification_preferences set categories = '[]' where user_id = ${alice}`,
       sql`update public.notification_preferences set reminder_offsets = '{45}' where user_id = ${alice}`,
       sql`update public.notification_preferences set reminder_session_types = '{warmup}' where user_id = ${alice}`,
       sql`update public.notification_preferences set preferred_timezone = 'Mars/Base' where user_id = ${alice}`,
@@ -90,6 +94,8 @@ describe('database security', { skip: skipNoDb }, () => {
       sql`update public.notification_preferences set quiet_hours_start = '07:00', quiet_hours_end = '07:00' where user_id = ${alice}`,
     ]
     for (const q of bad) assert.match(String(await q.catch((e) => e)), /violates check constraint/)
+    const viaApi = await asUser(sql, alice, (tx) => tx`update public.notification_preferences set categories = categories || '{"race_reminders": "lol"}'`).catch((e) => e)
+    assert.match(String(viaApi), /violates check constraint/)
   })
 
   test('push tokens are never readable by clients and only bound to the caller', async () => {

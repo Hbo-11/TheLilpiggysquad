@@ -20,6 +20,19 @@ language sql stable as $$
   select tz is not null and length(tz) <= 64 and exists (select 1 from pg_timezone_names where name = tz)
 $$;
 
+-- Preferences categories: only known optional categories, and only JSON booleans.
+-- Server queries rely on this (a bad value must never break delivery for others).
+create or replace function public.valid_notification_categories(c jsonb) returns boolean
+language sql immutable as $$
+  select jsonb_typeof(c) = 'object' and not exists (
+    select 1 from jsonb_each(c) e
+     where jsonb_typeof(e.value) <> 'boolean'
+        or e.key not in ('race_reminders', 'schedule_changes', 'race_results', 'driver_updates', 'team_updates',
+                         'news_major', 'news_breaking', 'ai_tasks', 'track_lab', 'sim_racing', 'weekly_summary',
+                         'product_updates')
+  )
+$$;
+
 create or replace function public.touch_updated_at() returns trigger
 language plpgsql as $$
 begin
@@ -125,6 +138,8 @@ create table public.events (
   -- IANA timezone of the venue. Times are never stored as fixed offsets.
   timezone text not null check (public.is_valid_timezone(timezone)),
   status text not null default 'scheduled' check (status in ('scheduled', 'postponed', 'cancelled', 'completed')),
+  -- The provider's own timestamp for this record; older updates are rejected as stale.
+  source_updated_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (source_id, external_ref)
@@ -150,6 +165,7 @@ create table public.event_sessions (
   results_published_at timestamptz,
   results_url text check (results_url ~ '^https://'),
   last_verified_at timestamptz not null default now(),
+  source_updated_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (source_id, external_ref),
@@ -213,7 +229,7 @@ create table public.notification_preferences (
     "driver_updates": true, "team_updates": true, "news_major": false,
     "news_breaking": false, "ai_tasks": true, "track_lab": true,
     "sim_racing": false, "weekly_summary": false, "product_updates": false
-  }'::jsonb check (jsonb_typeof(categories) = 'object'),
+  }'::jsonb check (public.valid_notification_categories(categories)),
   push_enabled boolean not null default true,
   reminder_offsets int[] not null default '{30}'
     check (reminder_offsets <@ array[1440, 60, 30, 15, 0] and cardinality(reminder_offsets) <= 5),
@@ -376,6 +392,11 @@ end $$;
 create trigger on_auth_user_created_notifications after insert on auth.users
   for each row execute function public.handle_new_user_notifications();
 
+-- Users who signed up before this migration get the recommended defaults too.
+insert into public.notification_preferences (user_id)
+select id from auth.users
+on conflict (user_id) do nothing;
+
 -- Password and email changes queue an account-security notification.
 create or replace function public.handle_auth_user_security_change() returns trigger
 language plpgsql security definer set search_path = public as $$
@@ -437,7 +458,7 @@ begin
   -- Deliveries still queued for the previous owner must not reach this device.
   update public.notification_deliveries
      set status = 'cancelled', error_code = 'DEVICE_REASSIGNED'
-   where device_id = v_device_id and status = 'pending' and user_id <> uid;
+   where device_id = v_device_id and status in ('pending', 'sending') and user_id <> uid;
   if tz is not null then
     insert into public.notification_preferences (user_id, device_timezone) values (uid, tz)
     on conflict (user_id) do update set device_timezone = excluded.device_timezone;
@@ -599,7 +620,7 @@ language sql stable security definer set search_path = public as $$
   select distinct i.user_id, i.session_id, i.offset_minutes, i.fire_at
     from interested i
     join public.notification_preferences p on p.user_id = i.user_id
-   where coalesce((p.categories ->> 'race_reminders')::boolean, false)
+   where p.categories -> 'race_reminders' = 'true'::jsonb
      and i.offset_minutes = any (p.reminder_offsets)
      and i.session_type = any (p.reminder_session_types)
 $$;
@@ -690,6 +711,7 @@ create policy notifications_update_own on public.notifications
 -- Functions: clients may call only the RPCs meant for them.
 revoke execute on all functions in schema public from public, anon, authenticated;
 grant execute on function public.is_valid_timezone(text) to anon, authenticated;
+grant execute on function public.valid_notification_categories(jsonb) to authenticated;
 grant execute on function public.register_push_device(text, text, text, text, text) to authenticated;
 grant execute on function public.unregister_push_device(text) to authenticated;
 grant execute on function public.remove_push_device(uuid) to authenticated;

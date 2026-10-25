@@ -24,7 +24,7 @@ apex/
 
 ```bash
 npm install
-npm test            # 93 tests: core logic, mobile logic, database security + end-to-end pipeline (local Postgres 16)
+npm test            # 105 tests: core logic, mobile logic, database security + end-to-end pipeline (local Postgres 16)
 npm run typecheck
 cd mobile && npx expo start   # without .env.local the app runs in clearly labelled demo mode
 ```

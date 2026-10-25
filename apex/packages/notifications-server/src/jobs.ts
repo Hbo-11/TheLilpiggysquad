@@ -45,10 +45,16 @@ export interface JobRunSummary {
 export async function processJobs(db: Db, opts: { now: Date; limit?: number }): Promise<JobRunSummary> {
   const { now } = opts
   const summary: JobRunSummary = { claimed: 0, done: 0, retried: 0, failed: 0 }
-  // Jobs whose worker died mid-run go back to the queue.
+  // Jobs whose worker died mid-run go back to the queue, unless they have used up
+  // their attempts (a job that keeps crashing the worker must not loop forever).
+  const stuckBefore = new Date(now.getTime() - STUCK_JOB_MS)
   await db`
-    update public.notification_jobs set status = 'queued', locked_at = null
-     where status = 'processing' and locked_at < ${new Date(now.getTime() - STUCK_JOB_MS)}`
+    update public.notification_jobs
+       set status = case when attempts >= ${MAX_JOB_ATTEMPTS} then 'failed' else 'queued' end,
+           last_error = case when attempts >= ${MAX_JOB_ATTEMPTS} then 'Worker stopped while running this job' else last_error end,
+           completed_at = case when attempts >= ${MAX_JOB_ATTEMPTS} then ${now}::timestamptz else completed_at end,
+           locked_at = null
+     where status = 'processing' and locked_at < ${stuckBefore}`
 
   const jobs = await db<JobRow[]>`
     update public.notification_jobs j
@@ -267,7 +273,7 @@ async function handleArticle(db: Db, articleId: string, now: Date): Promise<Reco
   const audience =
     a.championship_ids.length + a.driver_ids.length + a.team_ids.length > 0
       ? related
-      : (await db<{ user_id: string }[]>`select user_id from public.notification_preferences where (categories ->> ${category})::boolean`).map((r) => r.user_id)
+      : (await db<{ user_id: string }[]>`select user_id from public.notification_preferences where categories -> ${category}::text = 'true'::jsonb`).map((r) => r.user_id)
   results.news = await fanOut(db, { ...base, category }, audience, { now })
   return results
 }
@@ -323,6 +329,11 @@ async function handleSecurityEvent(db: Db, jobId: string, p: Record<string, unkn
   return { ...r }
 }
 
+/** Per user: two users' resources may share an id. */
+export function appEventJobKey(userId: string, kind: AppEventKind, resourceId: string): string {
+  return `app:${userId}:${kind}:${resourceId}`
+}
+
 /** Queue a notification for a finished/failed Apex AI or Track Lab job (trusted server code only). */
 export async function queueAppEvent(db: Db, input: { userId: string; kind: AppEventKind; resourceId: string; now?: Date }): Promise<boolean> {
   const now = input.now ?? new Date()
@@ -332,7 +343,7 @@ export async function queueAppEvent(db: Db, input: { userId: string; kind: AppEv
   const rows = await db`
     insert into public.notification_jobs (job_type, payload, idempotency_key, run_after, created_at)
     values ('app_event', ${db.json({ userId: input.userId, kind: input.kind, resourceId: input.resourceId } as never)},
-            ${dedupeKeys.appEvent(input.kind, input.resourceId)}, ${now}, ${now})
+            ${appEventJobKey(input.userId, input.kind, input.resourceId)}, ${now}, ${now})
     on conflict (idempotency_key) do nothing returning id`
   return rows.length > 0
 }
