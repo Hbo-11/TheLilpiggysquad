@@ -139,6 +139,24 @@ describe('database security', { skip: skipNoDb }, () => {
     assert.equal((await sql`select * from public.push_devices`).length, 0)
   })
 
+  test('users can remove their own devices by id, not anyone else\'s', async () => {
+    await asUser(sql, alice, (tx) => tx`select public.register_push_device(${token(1)}, 'ios')`)
+    const [{ id }] = await asUser(sql, alice, (tx) => tx`select id from public.my_push_devices()`)
+    const [{ ok: bobTry }] = await asUser(sql, bob, (tx) => tx`select public.remove_push_device(${id}) as ok`)
+    assert.equal(bobTry, false)
+    const [{ ok }] = await asUser(sql, alice, (tx) => tx`select public.remove_push_device(${id}) as ok`)
+    assert.equal(ok, true)
+  })
+
+  test('a device that signed out offline can release its token later without a session', async () => {
+    await asUser(sql, alice, (tx) => tx`select public.register_push_device(${token(1)}, 'ios')`)
+    const [{ ok }] = await asUser(sql, null, (tx) => tx`select public.release_push_token(${token(1)}) as ok`)
+    assert.equal(ok, true)
+    assert.equal((await sql`select * from public.push_devices`).length, 0)
+    const [{ ok: again }] = await asUser(sql, null, (tx) => tx`select public.release_push_token(${token(1)}) as ok`)
+    assert.equal(again, false)
+  })
+
   test('server-only tables and functions are closed to clients', async () => {
     for (const table of ['notification_deliveries', 'notification_jobs', 'reminder_scan_state', 'ingest_log', 'system_heartbeats']) {
       const r = await asUser(sql, alice, (tx) => tx.unsafe(`select * from public.${table}`)).catch((e) => e)

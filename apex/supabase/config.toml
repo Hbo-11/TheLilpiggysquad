@@ -1,0 +1,24 @@
+# Supabase CLI configuration for the Apex AI notification backend.
+# Only the settings this feature depends on are listed; merge into the project's
+# existing config.toml if Apex AI already has one.
+project_id = "apex-ai"
+
+[functions.process-notifications]
+verify_jwt = false # authenticated with APEX_INTERNAL_SECRET
+import_map = "./functions/deno.json"
+
+[functions.check-push-receipts]
+verify_jwt = false # authenticated with APEX_INTERNAL_SECRET
+import_map = "./functions/deno.json"
+
+[functions.notify-app-event]
+verify_jwt = false # authenticated with APEX_INTERNAL_SECRET
+import_map = "./functions/deno.json"
+
+[functions.ingest-motorsport-update]
+verify_jwt = false # authenticated with a per-provider HMAC signature
+import_map = "./functions/deno.json"
+
+[functions.send-test-notification]
+verify_jwt = true # signed-in users only
+import_map = "./functions/deno.json"

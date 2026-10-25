@@ -3,14 +3,17 @@
   "private": true,
   "description": "Apex AI notification system: shared core, Supabase backend and Expo mobile app.",
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "mobile"
   ],
   "scripts": {
-    "test": "npm run test:core && npm run test:server",
+    "test": "npm run test:core && npm run test:mobile && npm run test:db",
     "test:core": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test packages/notifications-core/test/*.test.ts",
+    "test:mobile": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test mobile/src/notifications/*.test.ts",
     "test:server": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test --test-concurrency=1 packages/notifications-server/test/*.test.ts",
     "test:db": "bash scripts/test-db.sh",
-    "typecheck": "tsc -p packages/notifications-core && tsc -p packages/notifications-server && tsc -p mobile"
+    "typecheck": "tsc -p packages/notifications-core && tsc -p packages/notifications-server && tsc --noEmit -p mobile",
+    "check:functions": "cd supabase/functions && deno check --config deno.json */index.ts"
   },
   "devDependencies": {
     "typescript": "5.9.3",

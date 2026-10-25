@@ -457,6 +457,31 @@ begin
   return removed > 0;
 end $$;
 
+-- Release a token by possession. Used when sign-out happened offline and the app can
+-- no longer authenticate as the previous user: only the device holding the token can
+-- call this, and the worst a leaked token allows is stopping pushes to that device.
+create or replace function public.release_push_token(p_token text) returns boolean
+language plpgsql security definer set search_path = public as $$
+declare
+  removed int;
+begin
+  delete from public.push_devices where expo_push_token = p_token;
+  get diagnostics removed = row_count;
+  return removed > 0;
+end $$;
+
+-- Remove one of the caller's devices by id (e.g. a lost phone, from Account security).
+create or replace function public.remove_push_device(p_device_id uuid) returns boolean
+language plpgsql security definer set search_path = public as $$
+declare
+  removed int;
+begin
+  if auth.uid() is null then raise exception 'not authenticated' using errcode = '42501'; end if;
+  delete from public.push_devices where id = p_device_id and user_id = auth.uid();
+  get diagnostics removed = row_count;
+  return removed > 0;
+end $$;
+
 -- The caller's devices without exposing full tokens.
 create or replace function public.my_push_devices()
 returns table (id uuid, platform text, device_name text, app_version text, last_registered_at timestamptz,
@@ -667,6 +692,8 @@ revoke execute on all functions in schema public from public, anon, authenticate
 grant execute on function public.is_valid_timezone(text) to anon, authenticated;
 grant execute on function public.register_push_device(text, text, text, text, text) to authenticated;
 grant execute on function public.unregister_push_device(text) to authenticated;
+grant execute on function public.remove_push_device(uuid) to authenticated;
+grant execute on function public.release_push_token(text) to anon, authenticated;
 grant execute on function public.my_push_devices() to authenticated;
 grant execute on function public.report_device_timezone(text) to authenticated;
 grant execute on function public.mark_all_notifications_read() to authenticated;

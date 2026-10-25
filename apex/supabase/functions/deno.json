@@ -1,0 +1,7 @@
+{
+  "imports": {
+    "@apex/notifications-core": "../../packages/notifications-core/src/index.ts",
+    "@apex/notifications-server": "../../packages/notifications-server/src/index.ts",
+    "postgres": "npm:postgres@3.4.9"
+  }
+}
