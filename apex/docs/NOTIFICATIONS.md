@@ -102,6 +102,7 @@ Security properties (each covered by `packages/notifications-server/test/databas
 - **Postponed or cancelled**: no further reminders, and followers are notified. Cancelling a whole event cascades to its sessions.
 - **Session started**: sent only to users who chose "at session start" and haven't already had that reminder.
 - Each device gets reminders through exactly one mechanism. Registered devices get them from the server. Devices with permission but no server registration use local scheduling, reconciled whenever the app opens or a schedule-change push arrives. Devices without permission see them in the app only.
+- Local scheduling currently covers followed championships only. Reminders from driver and team follows and saved events need server push. iOS keeps at most 64 pending local notifications, so the app schedules the 60 soonest.
 
 **Timezones**
 - Sessions store an absolute instant (`timestamptz`) plus the venue's IANA zone and the wall time exactly as published. Offsets are never stored.

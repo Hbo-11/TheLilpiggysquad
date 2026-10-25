@@ -116,6 +116,9 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
   // Preferences and follows for the current user (or this device when signed out / demo).
   useEffect(() => {
     let cancelled = false
+    // Drop any pending save for the previous account before loading this one.
+    if (saveTimer.current) clearTimeout(saveTimer.current)
+    latestPrefs.current = null
     setPrefs(null)
     loadPreferences(userId)
       .then(({ prefs: p }) => {
@@ -164,7 +167,11 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
 
   const toggleFollow = useCallback(
     async (entityType: EntityType, entityId: string, on: boolean) => {
-      setFollows(await persistFollow(userId, { entity_type: entityType, entity_id: entityId }, on, follows))
+      try {
+        setFollows(await persistFollow(userId, { entity_type: entityType, entity_id: entityId }, on, follows))
+      } catch {
+        // Leave the toggle as it was; the next load reflects the server state.
+      }
     },
     [userId, follows],
   )
