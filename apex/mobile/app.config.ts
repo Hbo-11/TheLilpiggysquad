@@ -15,6 +15,9 @@ const config: ExpoConfig = {
   ios: {
     bundleIdentifier: process.env.APEX_IOS_BUNDLE_ID ?? 'ai.apex.app',
     supportsTablet: true,
+    // Session reminders and security alerts are sent as "time-sensitive" so they can
+    // break through Focus modes the user allows. Requires the capability on the App ID.
+    entitlements: { 'com.apple.developer.usernotifications.time-sensitive': true },
   },
   android: {
     package: process.env.APEX_ANDROID_PACKAGE ?? 'ai.apex.app',

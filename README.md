@@ -32,3 +32,7 @@ npm install && npm run build
 PORT=4123 node server.js
 ```
 The Express server serves the built frontend and the API from a single port.
+
+## Apex AI notification system (`apex/`)
+A separate, self-contained workspace for the Apex AI notification system (Expo app, Supabase backend,
+shared logic and tests). It does not affect this website. See [`apex/README.md`](apex/README.md).
